@@ -3,7 +3,7 @@ use std::{io::Write, sync::LazyLock};
 use anyhow::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use mongodb::{
-    bson::Document,
+    bson::{doc, Bson, Document},
     options::{ClientOptions, Tls, TlsOptions},
     Client, Database,
 };
@@ -23,17 +23,28 @@ static STYLE_DB: LazyLock<ProgressStyle> = LazyLock::new(|| {
 });
 
 #[derive(Serialize)]
+struct MongoInfo {
+    databases: Vec<DatabaseInfo>,
+    users: Bson,
+}
+
+#[derive(Serialize)]
 struct DatabaseInfo {
-    name: String,
+    database_name: String,
     collections: Vec<CollectionInfo>,
 }
 
 #[derive(Serialize)]
 struct CollectionInfo {
-    name: String,
+    collection_name: String,
     indexes: Vec<String>,
     doc_count: u64,
 }
+
+// #[derive(Serialize)]
+// struct UserInfo {
+//     name: String,
+// }
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -53,40 +64,50 @@ async fn main() -> Result<()> {
         let main_pb = &main_pb;
         let pb = mp.add(
             ProgressBar::new(0)
-                .with_prefix(db_info.name.clone())
+                .with_prefix(db_info.database_name.clone())
                 .with_style(STYLE_DB.clone()),
         );
         async move {
-            let db = client.database(&db_info.name);
+            let db = client.database(&db_info.database_name);
             db_info.collections = get_collections(&db).await?;
             pb.set_length(db_info.collections.len() as u64);
             let handles = db_info.collections.iter_mut().map(|coll_info| {
                 let db = db.clone();
                 let pb = &pb;
                 async move {
-                    let coll = db.collection::<Document>(&coll_info.name);
+                    let coll = db.collection::<Document>(&coll_info.collection_name);
                     coll_info.doc_count = coll.estimated_document_count().await?;
                     let indexes = coll.list_index_names().await?;
                     coll_info.indexes = indexes;
-                    pb.tick();
+                    pb.inc(1);
                     anyhow::Ok(())
                 }
             });
             futures::future::join_all(handles).await;
             pb.finish_and_clear();
-            main_pb.tick();
+            main_pb.inc(1);
             anyhow::Ok(())
         }
     });
     futures::future::join_all(handles).await;
     main_pb.finish();
 
+    let users = client
+        .database("admin")
+        .run_command(doc! { "usersInfo": 1 })
+        .await?;
+
+    let mongo_info = MongoInfo {
+        databases: result,
+        users: users.get("users").expect("get users").clone(),
+    };
+
     let mut fp = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open("./result.json")?;
-    let output = serde_json::to_string_pretty(&result)?;
+    let output = serde_json::to_string_pretty(&mongo_info)?;
     fp.write_all(output.as_bytes())?;
     fp.flush()?;
 
@@ -116,11 +137,11 @@ async fn get_databases(client: &Client) -> Result<Vec<DatabaseInfo>> {
         .into_iter()
         .filter(|db| !EXCLUDED_DB.contains(&db.as_str()))
         .map(|db| DatabaseInfo {
-            name: db,
+            database_name: db,
             collections: Vec::new(),
         })
         .collect::<Vec<_>>();
-    result.sort_by(|entry1, entry2| entry1.name.cmp(&entry2.name));
+    result.sort_by(|entry1, entry2| entry1.database_name.cmp(&entry2.database_name));
     Ok(result)
 }
 
@@ -129,11 +150,11 @@ async fn get_collections(db: &Database) -> Result<Vec<CollectionInfo>> {
     let mut result = collection_names
         .into_iter()
         .map(|coll| CollectionInfo {
-            name: coll,
+            collection_name: coll,
             doc_count: 0,
             indexes: Vec::new(),
         })
         .collect::<Vec<_>>();
-    result.sort_by(|e1, e2| e1.name.cmp(&e2.name));
+    result.sort_by(|e1, e2| e1.collection_name.cmp(&e2.collection_name));
     Ok(result)
 }
